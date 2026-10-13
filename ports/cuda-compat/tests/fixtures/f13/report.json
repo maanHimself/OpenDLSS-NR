@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "scope": "Independent synthetic F13 arithmetic inputs and expected results.",
+  "generator": "tools/generate_numeric_fixtures.py",
+  "files": [
+    {
+      "file": "f13-integer-groups.bin",
+      "bytes": 294912,
+      "sha256": "2e0fb807b97f83a0e4edc9dd4c02a77a5a2b38bc29d0e85b05badcfc9fd0d4a5",
+      "records": 4096,
+      "record_bytes": 72,
+      "layout": "A[16] f16, B[16] f16, incoming f32, expected retained f32; little endian; no header"
+    },
+    {
+      "file": "f13-integer-gemm-00.bin",
+      "bytes": 673,
+      "sha256": "3b05afea2fe5a57a9189a4240b08559a3b6c8bebf5ad157524214df2520472ea",
+      "m": 3,
+      "k": 32,
+      "n": 5,
+      "partition": 0,
+      "layout": "4 u32 M,K,N,partition; A f16; W f16; residual f16; scale f16; expected f32; raw RTZ f16; E4 u8. Arrays row-major, little endian."
+    },
+    {
+      "file": "f13-integer-gemm-01.bin",
+      "bytes": 12177,
+      "sha256": "a086631168037243a83b53cd58676321e9af2a8d55737b04790cfb5ef4c510d2",
+      "m": 17,
+      "k": 128,
+      "n": 19,
+      "partition": 64,
+      "layout": "4 u32 M,K,N,partition; A f16; W f16; residual f16; scale f16; expected f32; raw RTZ f16; E4 u8. Arrays row-major, little endian."
+    },
+    {
+      "file": "f13-integer-gemm-02.bin",
+      "bytes": 3417,
+      "sha256": "3268a281957d91088e9866f757493564eae03abc9f6be6146d87eacec4a4a781",
+      "m": 5,
+      "k": 128,
+      "n": 7,
+      "partition": 32,
+      "layout": "4 u32 M,K,N,partition; A f16; W f16; residual f16; scale f16; expected f32; raw RTZ f16; E4 u8. Arrays row-major, little endian."
+    },
+    {
+      "file": "f13-integer-gemm-03.bin",
+      "bytes": 10316,
+      "sha256": "8c5b6154a55ee607c91bcc7c3dc532a48800a6cc38facc7c33aa5a9d4d107762",
+      "m": 2,
+      "k": 1024,
+      "n": 3,
+      "partition": 256,
+      "layout": "4 u32 M,K,N,partition; A f16; W f16; residual f16; scale f16; expected f32; raw RTZ f16; E4 u8. Arrays row-major, little endian."
+    },
+    {
+      "file": "f13-integer-gemm-04.bin",
+      "bytes": 1441,
+      "sha256": "539bfb4bdddecd34ff5d9c4f2a3bc07e8eb8f6a271b1238cd1f3d3f8299d5317",
+      "m": 3,
+      "k": 80,
+      "n": 5,
+      "partition": 32,
+      "layout": "4 u32 M,K,N,partition; A f16; W f16; residual f16; scale f16; expected f32; raw RTZ f16; E4 u8. Arrays row-major, little endian."
+    },
+    {
+      "file": "f13-integer-gemm-05.bin",
+      "bytes": 49255,
+      "sha256": "af0a9c6e3339b01e6e7f831407f5abc301047dced361c6c5115b071c6dd9729b",
+      "m": 3,
+      "k": 4096,
+      "n": 3,
+      "partition": 1024,
+      "layout": "4 u32 M,K,N,partition; A f16; W f16; residual f16; scale f16; expected f32; raw RTZ f16; E4 u8. Arrays row-major, little endian."
+    }
+  ]
+}

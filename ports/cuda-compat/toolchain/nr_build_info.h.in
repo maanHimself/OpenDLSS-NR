@@ -1,0 +1,3 @@
+#pragma once
+#define NR_SOURCE_SHA256 "@NR_SOURCE_SHA256@"
+#define NR_BUILD_INFO R"nrbuild({"abi_version":1,"arithmetic":"browser-compat-v1","source_sha256":"@NR_SOURCE_SHA256@","configuration_sha256":"@NR_CONFIGURATION_SHA256@","cuda_compiler":"@CMAKE_CUDA_COMPILER_ID@ @CMAKE_CUDA_COMPILER_VERSION@","host_compiler":"@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@","cuda_architectures":[75],"ftz":false,"cxx_standard":17})nrbuild"

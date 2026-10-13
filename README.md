@@ -8,6 +8,11 @@ intermediates match too, not just the final image: all 75 block boundaries, byte
 `ports/browser-webgpu/` is a second, independent implementation: the same bytes in a browser, with no
 tensor cores and no FP8.
 
+[`ports/cuda-compat/`](ports/cuda-compat/README.md) provides an optional Linux CUDA SM75
+feature-to-head interface using software compatibility arithmetic, without native FP8 instructions.
+Its [numerical contract](ports/cuda-compat/docs/arithmetic.md) identifies the pinned browser behavior
+separately from original/Vulkan parity.
+
 **You supply the weights**, as a model directory in the layout described below.
 
 ## The network

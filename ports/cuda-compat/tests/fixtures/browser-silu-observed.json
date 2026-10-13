@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "scope": "Observed Chrome/Vulkan SiLU behavior on RTX 2060; finite-half inputs.",
+  "fixture_sha256": "9c9c1b971054a2f0bdbfe263567bf2f64ffaaab945901f4dae329ee614e57b23",
+  "bytes": 262144,
+  "records": 65536,
+  "record_layout": "4 bytes per input half bit pattern: observed activated half bits LE u16, observed packed E4 u8, reserved zero u8",
+  "upstream_commit": "9d08f4184bbcb9d858e2fb7a7834ec0837a9d2f1",
+  "model_sha256": "11be575b6785a5f262a63448565e86f495e11a51a663175b7e47e0687abfdf20",
+  "reference_pins_sha256": "a46c1b3f1631444588962ce86594c1604df8e79678a6d5f351a4bc566c86c89d",
+  "source_capture": "reference-silu-tables-001",
+  "source_tables": [
+    {
+      "job": "capture-0000",
+      "name": "table-silu-half-e4",
+      "file": "capture-0000-boundary-table-silu-half-e4.bin",
+      "sha256": "ccfb5bb71d333c6b4fcafa39d9ef0176a1bff59f60d0c7d9f86cb98bc43eac07",
+      "bytes": 262144,
+      "rows": "65536",
+      "channels": "2",
+      "format": "f16"
+    },
+    {
+      "job": "capture-0000",
+      "name": "table-silu-packed",
+      "file": "capture-0000-boundary-table-silu-packed.bin",
+      "sha256": "7a319e81c1bd926867d2e8c5c0125f7c41f26b5c2840b707909ee09d3a0b5820",
+      "bytes": 65536,
+      "rows": "65536",
+      "channels": "1",
+      "format": "e4"
+    }
+  ],
+  "browser_version": "153.0.8010.52",
+  "browser_binary_sha256": "0f2256d365ab3d82a2c79ce41f65a03dfd8d7eaa4d689a1b88bc22b6842b1f1e",
+  "driver": "595.91.07",
+  "dawn_features": [
+    "vulkan_enable_f16_on_nvidia"
+  ]
+}

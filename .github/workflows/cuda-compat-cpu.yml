@@ -1,0 +1,50 @@
+name: CUDA compatibility CPU checks
+
+on:
+  pull_request:
+    paths:
+      - 'ports/cuda-compat/**'
+      - '.github/workflows/cuda-compat-cpu.yml'
+  push:
+    paths:
+      - 'ports/cuda-compat/**'
+      - '.github/workflows/cuda-compat-cpu.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned CUDA toolchain
+        run: docker build --tag opendlss-cuda-compat-build ports/cuda-compat/toolchain
+      - name: Compile SM75 native targets and run host tests
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE/ports/cuda-compat:/workspace" \
+            opendlss-cuda-compat-build bash -lc '
+              set -euo pipefail
+              cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_ARCHITECTURES=75 -DBUILD_TESTING=ON
+              cmake --build build --parallel 4
+              ctest --test-dir build -L host --no-tests=error --output-on-failure
+            '
+  python:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '${{ matrix.python }}'
+      - run: python -m pip install ./ports/cuda-compat
+      - run: python -m unittest discover -s ports/cuda-compat/tests -p 'test_*.py' -v
+      - name: Installed CLI outside checkout
+        working-directory: /tmp
+        run: python -m opendlss_cuda --help
