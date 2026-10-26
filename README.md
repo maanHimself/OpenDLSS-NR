@@ -106,8 +106,10 @@ reference captures were made with.
 them out into the matrix forms the kernels consume (`src/nr_model.cpp`). Nothing in this repository produces
 such a directory.
 
-The graph is the 71-block network of 310.8.0 and nothing else: a model with a different block count is refused
-at load.
+The graph runs two networks: the 71-block network of 310.8.0, and the 31-block small network that build 310.9.16
+of the DLL also carries (`WEIGHTS_CC_SMALL_FP8`; NGX runs it at its default preset there). They share every block
+type and differ only in how many blocks each stage repeats (`nr::Topology`). A model with any other block count
+is refused at load.
 
 ## Fixtures
 

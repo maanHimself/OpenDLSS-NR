@@ -142,7 +142,7 @@ Graph::Routes Graph::routesFromEnvironment() {
 
 Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometry& geometry, Options options)
     : context_(context), model_(model), kernels_(kernels), geometry_(geometry), options_(options),
-      routes_(routesFromEnvironment()) {
+      routes_(routesFromEnvironment()), topology_(Topology::forBlockCount(model.blockCount())) {
   // Chaining links consecutive PTX launches through device counters and drops the barrier between them, so every
   // launch in the chain must take its PTX route. Any switch that sends one kernel family (or one fused block)
   // back to GLSL takes the whole graph back to barriers.
@@ -161,9 +161,6 @@ Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometr
             geometry_.fullHeight, tallestRow, Kernels::kSyncCountersPerRegion);
     routes_.chain = routes_.vitChain = false;
   }
-  if (model_.blockCount() != kBlockCount)
-    throw std::runtime_error("the model has " + std::to_string(model_.blockCount()) + " blocks; this graph is the " +
-                             std::to_string(kBlockCount) + "-block network");
 }
 
 Graph::~Graph() {
@@ -193,18 +190,24 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
   return activations_.back().get();
 }
 
-const std::vector<std::string>& Graph::referenceBoundaryNames() {
-  static const std::vector<std::string> names = [] {
-    std::vector<std::string> list;
-    const int transitionsAfter[] = {0, 4, 8, 14, 22};
-    for (int block = 0; block <= 69; ++block) {
-      list.push_back("block-" + std::to_string(block));
-      if (std::find(std::begin(transitionsAfter), std::end(transitionsAfter), block) != std::end(transitionsAfter))
-        list.push_back("transition-" + std::to_string(block) + "-" + std::to_string(block + 1));
-    }
-    return list;
-  }();
-  return names;
+Topology Topology::forBlockCount(uint32_t blocks) {
+  if (blocks == 71)
+    return {4, {5, 9, 15}, {8, 14, 22}, 23, 30, 31, 38, 39, 40, 47, {48, 56, 62, 66}, {55, 61, 65, 69}, 70};
+  if (blocks == 31)
+    return {2, {3, 5, 7}, {4, 6, 8}, 9, 10, 11, 18, 19, 20, 21, {22, 24, 26, 28}, {23, 25, 27, 29}, 30};
+  throw std::runtime_error("no graph for a model of " + std::to_string(blocks) + " blocks (71 or 31)");
+}
+
+std::vector<std::string> Graph::referenceBoundaryNames(uint32_t blockCount) {
+  const Topology t = Topology::forBlockCount(blockCount);
+  std::vector<std::string> list;
+  const int transitionsAfter[] = {0, t.enc32Last, t.encLast[0], t.encLast[1], t.encLast[2]};
+  for (int block = 0; block < t.post; ++block) {
+    list.push_back("block-" + std::to_string(block));
+    if (std::find(std::begin(transitionsAfter), std::end(transitionsAfter), block) != std::end(transitionsAfter))
+      list.push_back("transition-" + std::to_string(block) + "-" + std::to_string(block + 1));
+  }
+  return list;
 }
 
 void Graph::capture(VkCommandBuffer commands, const std::string& name, const Activation& source) {
@@ -592,7 +595,8 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
   // the producer's column-group count at kSyncRows + 4 * {0 expand, 1 contract, 2 qkv, 4 projection}).
   const bool chain = routes_.vitChain;
   auto vitCounter = [&](int block, int op) { return kernels_.syncAddress(block, Kernels::kSyncRows) + 4 * op; };
-  for (int block = 31; block <= 38; ++block) {
+  const Topology& t = topology_;
+  for (int block = t.vitFirst; block <= t.vitLast; ++block) {
     kernels_.setStageLabel("block " + std::to_string(block) + " vit");
     const Tensor& expand = model_.tensor(block, 0);
     const Tensor& contract = model_.tensor(block, 1);
@@ -604,7 +608,7 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
     e.output = expanded; e.silu = true; e.quantize = true;
     e.chainSingle = true;
     if (chain) {
-      if (block > 31) { e.chainWaitRows = vitCounter(block - 1, 4); e.chainWaitExpected = Kernels::vitGemmSignals(tokens, channels); }
+      if (block > t.vitFirst) { e.chainWaitRows = vitCounter(block - 1, 4); e.chainWaitExpected = Kernels::vitGemmSignals(tokens, channels); }
       e.chainSignal = vitCounter(block, 0); e.chained = true;
     }
     kernels_.gemmFp8(commands, e);
@@ -661,7 +665,7 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
     p.output = &state; p.quantize = true;
     p.residual = ffnResidual; p.scaleResidual = true; p.auxTensor = &projection; p.auxByteOffset = channels * channels;
     if (chain && attnPtx) { p.chainWaitRows = vitCounter(block, 3); p.chainWaitExpected = heads * (padded / 64); }
-    if (chain && block < 38) { p.chainSignal = vitCounter(block, 4); p.chained = true; }   // the next block's expand waits
+    if (chain && block < t.vitLast) { p.chainSignal = vitCounter(block, 4); p.chained = true; }   // the next block's expand waits
     kernels_.gemmFp8(commands, p);
     capture(commands, "block-" + std::to_string(block), state);
   }
@@ -757,11 +761,13 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   const uint32_t rows1 = d1.width * d1.height;
   Activation* downsampled32 = allocate("encoder 32 downsample", rows1, 32, Format::E4);
   const bool poolBlock4 = options_.fusedBlocks && !options_.captureIntermediates && fusePool;
-  for (int block = 1; block <= 4; ++block) {
+  const Topology& tp = topology_;
+  const int e32 = tp.enc32Last;
+  for (int block = 1; block <= e32; ++block) {
     encodeFusedBlock(commands, latentTemps, *state, scratch, block, 32, d0.width, d0.height, takeWindowPhase(0),
-                     fusedLayout(32), model_.tensor(block), nullptr, (block == 4 && !poolBlock4) ? transitionRaw32 : nullptr,
-                     (block == 4 && poolBlock4) ? downsampled32 : nullptr, d1.width, false, true, true,
-                     block == 1 ? 1u : 0u, block != 4);
+                     fusedLayout(32), model_.tensor(block), nullptr, (block == e32 && !poolBlock4) ? transitionRaw32 : nullptr,
+                     (block == e32 && poolBlock4) ? downsampled32 : nullptr, d1.width, false, true, true,
+                     block == 1 ? 1u : 0u, block != e32);
     std::swap(state, scratch);
     capture(commands, "block-" + std::to_string(block), *state);
   }
@@ -773,15 +779,17 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
   {
     GemmFp8Args t;
     t.input = downsampled32; t.rows = rows1; t.K = 32; t.N = 64;
-    t.weights = &model_.fp8Matrix(model_.tensor(4), fusedLayout(32).endWithoutPadding, 32, 64); t.Nmatrix = 64;
+    t.weights = &model_.fp8Matrix(model_.tensor(e32), fusedLayout(32).endWithoutPadding, 32, 64); t.Nmatrix = 64;
     t.output = next64; t.quantize = true;
     kernels_.gemmFp8(commands, t);
   }
-  capture(commands, "transition-4-5", *next64);
+  capture(commands, "transition-" + std::to_string(e32) + "-" + std::to_string(e32 + 1), *next64);
 
   // ---- Encoder fused stages 64 / 128 / 256.
   struct FusedStage { Geometry::Level level, next; uint32_t channels; int first, last, levelIndex; };
-  const FusedStage encoderStages[] = {{d1, d2, 64, 5, 8, 1}, {d2, d3, 128, 9, 14, 2}, {d3, d4, 256, 15, 22, 3}};
+  const FusedStage encoderStages[] = {{d1, d2, 64, tp.encFirst[0], tp.encLast[0], 1},
+                                      {d2, d3, 128, tp.encFirst[1], tp.encLast[1], 2},
+                                      {d3, d4, 256, tp.encFirst[2], tp.encLast[2], 3}};
   Activation* skips[3] = {};
   Activation* stageInput = next64;
   for (int s = 0; s < 3; ++s) {
@@ -829,9 +837,9 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     Activation* sc = allocate("encoder 512 state", rows4, 512, Format::E4);
     Activation* raw = allocate("encoder 512 raw transition", rows4, 512, Format::F16);
     SplitTemporaries temps = createSplitTemporaries("encoder 512", rows4);
-    for (int block = 23; block <= 30; ++block) {
+    for (int block = tp.enc512First; block <= tp.enc512Last; ++block) {
       encodeSplitBlock(commands, temps, *st, sc, block, d4.width, d4.height, takeWindowPhase(4),
-                       block == 30 ? raw : nullptr, block == 23, block == 30);
+                       block == tp.enc512Last ? raw : nullptr, block == tp.enc512First, block == tp.enc512Last);
       std::swap(st, sc);
       capture(commands, "block-" + std::to_string(block), *st);
     }
@@ -843,7 +851,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     Activation* vitState = allocate("ViT state", tokens, 1024, Format::E4);
     GemmFp8Args t;
     t.input = pooled; t.rows = tokens; t.K = 512; t.N = 1024;
-    t.weights = &model_.fp8Matrix(model_.tensor(30, 4), 0, 512, 1024); t.Nmatrix = 1024;
+    t.weights = &model_.fp8Matrix(model_.tensor(tp.enc512Last, 4), 0, 512, 1024); t.Nmatrix = 1024;
     t.output = vitState; t.quantize = true;
     kernels_.gemmFp8(commands, t);
 
@@ -855,19 +863,19 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     Activation* projected512 = allocate("decoder 512 projection", tokens, 512, Format::F16);
     GemmFp8Args p;
     p.input = vitState; p.rows = tokens; p.K = 1024; p.N = 512; p.partition = 256;
-    p.weights = &model_.fp8Matrix(model_.tensor(39), 0, 1024, 512); p.Nmatrix = 512;
+    p.weights = &model_.fp8Matrix(model_.tensor(tp.dec512Transition), 0, 1024, 512); p.Nmatrix = 512;
     p.output = projected512; p.quantize = false;
     kernels_.gemmFp8(commands, p);
     Activation* merged = allocate("decoder 512 skip merge", rows4, 512, Format::E4);
-    kernels_.upsampleResidual(commands, *projected512, *skip512, model_.tensor(39), 1024 * 512, *merged, nullptr,
+    kernels_.upsampleResidual(commands, *projected512, *skip512, model_.tensor(tp.dec512Transition), 1024 * 512, *merged, nullptr,
                               d5.width, d5.height, d4.width, d4.height);
-    capture(commands, "block-39", *merged);
+    capture(commands, "block-" + std::to_string(tp.dec512Transition), *merged);
     Activation* dst = merged;
     Activation* dsc = allocate("decoder 512 state", rows4, 512, Format::E4);
     SplitTemporaries dtemps = createSplitTemporaries("decoder 512", rows4);
-    for (int block = 40; block <= 47; ++block) {
+    for (int block = tp.dec512First; block <= tp.dec512Last; ++block) {
       encodeSplitBlock(commands, dtemps, *dst, dsc, block, d4.width, d4.height, takeWindowPhase(4), nullptr,
-                       block == 40, block == 47);
+                       block == tp.dec512First, block == tp.dec512Last);
       std::swap(dst, dsc);
       capture(commands, "block-" + std::to_string(block), *dst);
     }
@@ -876,8 +884,10 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
 
   // ---- Decoder fused stages 256 / 128 / 64 / 32.
   struct DecoderStage { Geometry::Level low, high; uint32_t channels; int first, last, levelIndex; Activation* skip; };
-  const DecoderStage decoderStages[] = {{d4, d3, 256, 48, 55, 3, skip256}, {d3, d2, 128, 56, 61, 2, skip128},
-                                        {d2, d1, 64, 62, 65, 1, skip64}, {d1, d0, 32, 66, 69, 0, skip32}};
+  const DecoderStage decoderStages[] = {{d4, d3, 256, tp.decFirst[0], tp.decLast[0], 3, skip256},
+                                        {d3, d2, 128, tp.decFirst[1], tp.decLast[1], 2, skip128},
+                                        {d2, d1, 64, tp.decFirst[2], tp.decLast[2], 1, skip64},
+                                        {d1, d0, 32, tp.decFirst[3], tp.decLast[3], 0, skip32}};
   for (const DecoderStage& stage : decoderStages) {
     const uint32_t lowRows = stage.low.width * stage.low.height;
     const uint32_t rows = stage.high.width * stage.high.height;
@@ -946,12 +956,12 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
     stageInput = st;
   }
 
-  // ---- Full-resolution post block 70 and the RGBA head.
+  // ---- Full-resolution post block (70; 30 in the small network) and the RGBA head.
   {
-    const Tensor& tensor = model_.tensor(70);
+    const Tensor& tensor = model_.tensor(tp.post);
     kernels_.setStageLabel("post");
     FusedLayout layout = postFusedLayout();
-    if (tensor.byteLength != layout.endWithoutPadding) throw std::runtime_error("unexpected block70 layout");
+    if (tensor.byteLength != layout.endWithoutPadding) throw std::runtime_error("unexpected post block (block " + std::to_string(tp.post) + ") layout");
     head_ = allocate("RGBA neural head", fullRows, 4, Format::F32);
     if (options_.fusedBlocks && !options_.captureIntermediates && routes_.fusePost) {
       // The post blend (2x upsample of block 69 + block 0, learned scales) feeds block 70 in registers and the
@@ -960,7 +970,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       const vk::Buffer& headWeights = model_.f16Matrix(tensor, layout.postWeights, 32, 4, paddedN);
       uint32_t shiftX, shiftY;
       windowPhase(takeWindowPhase(kFullLevel), shiftX, shiftY);
-      kernels_.setStageLabel("block 70 c32");
+      kernels_.setStageLabel("block " + std::to_string(tp.post) + " c32");
       Kernels::FusedBlock32Args f;
       f.state = adapter; f.lowRes = stageInput; f.lowWidth = d0.width;
       f.inputScaleByteOffset = layout.inputScale; f.adapterScaleByteOffset = layout.adapterScale;
@@ -980,7 +990,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
       f.attentionScaleByteOffset = layout.scale;
       f.headWeights = &headWeights; f.head = head_;
       f.width = g.fullWidth; f.height = g.fullHeight; f.shiftX = shiftX; f.shiftY = shiftY;
-      chainBlock32(f, 70, 2, false);
+      chainBlock32(f, tp.post, 2, false);
       kernels_.fusedBlock32(commands, f);
     } else {
       Activation* rawMerged = allocate("post raw merge", fullRows, 32, Format::F16);
@@ -989,7 +999,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
                          *merged, d0.width, d0.height, g.fullWidth, g.fullHeight);
       Activation* rawBlockOutput = allocate("post raw block output", fullRows, 32, Format::F16);
       Temporaries temps = createTemporaries("post", fullRows, 32);
-      encodeFusedBlock(commands, temps, *merged, nullptr, 70, 32, g.fullWidth, g.fullHeight,
+      encodeFusedBlock(commands, temps, *merged, nullptr, tp.post, 32, g.fullWidth, g.fullHeight,
                        takeWindowPhase(kFullLevel), layout, tensor, rawMerged, rawBlockOutput);
       kernels_.setStageLabel("head");
       uint32_t paddedN = 0;

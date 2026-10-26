@@ -97,7 +97,7 @@ int64_t fileSize(const std::string& path) {
   return error ? -1 : (int64_t)size;
 }
 
-FixturePlan planFixture(const json::Value& manifest, const std::string& fixtureDir) {
+FixturePlan planFixture(const json::Value& manifest, const std::string& fixtureDir, uint32_t blockCount) {
   FixturePlan plan;
   std::vector<std::string> problems;
   auto fail = [&](const std::string& text) { problems.push_back(text); };
@@ -181,7 +181,7 @@ FixturePlan planFixture(const json::Value& manifest, const std::string& fixtureD
         if (reason.str().empty()) fail("omitted boundary " + name + " gives no reason");
         omitted[name] = reason.str();
       }
-    const std::vector<std::string>& names = nr::Graph::referenceBoundaryNames();
+    const std::vector<std::string> names = nr::Graph::referenceBoundaryNames(blockCount);
     for (const auto& [name, ref] : byName)
       if (std::find(names.begin(), names.end(), name) == names.end()) fail(name + " is not a boundary of this graph");
     for (const auto& [name, reason] : omitted) {
@@ -413,7 +413,9 @@ int runParity(int argc, char** argv) {
     return 2;
   }
   json::Value manifest = json::parse(readText(fixtureDir + "/manifest.json"));
-  const FixturePlan plan = planFixture(manifest, fixtureDir);
+  // the boundaries a fixture can reference depend on the network (71 blocks, or 31 for the small one)
+  const uint32_t blockCount = (uint32_t)json::parse(readText(modelDir + "/manifest.json"))["totals"]["blockCount"].integer();
+  const FixturePlan plan = planFixture(manifest, fixtureDir, blockCount);
 
   vk::Context context;
   printf("device: %s\n", context.deviceName().c_str());

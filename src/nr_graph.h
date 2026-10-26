@@ -1,4 +1,4 @@
-// The NR network graph: 71 blocks over a six-level encoder/decoder with a global
+// The NR network graph: 71 blocks (31 in the small network) over a six-level encoder/decoder with a global
 // ViT bottleneck, recorded into one Vulkan command buffer.
 #pragma once
 #include <functional>
@@ -22,6 +22,20 @@ struct Geometry {
   uint32_t paddedVitTokens() const { return (vitTokens() + 63) & ~63u; }
 };
 
+// Which block numbers each stage holds. The full network (71 blocks) and the small one (31) share every block
+// type and differ only in how many blocks each stage repeats.
+struct Topology {
+  int enc32Last;                 // blocks 1..enc32Last at level 0; the last one carries the 32 -> 64 transition
+  int encFirst[3], encLast[3];   // the fused encoder stages 64 / 128 / 256
+  int enc512First, enc512Last;   // split blocks; the last one's layer4 is the ViT input projection
+  int vitFirst, vitLast;
+  int dec512Transition;          // ViT -> 512 projection and skip merge
+  int dec512First, dec512Last;
+  int decFirst[4], decLast[4];   // the fused decoder stages 256 / 128 / 64 / 32 (first = upsample transition)
+  int post;                      // full-resolution post block and head (blend_scale)
+  static Topology forBlockCount(uint32_t blocks);   // 71 or 31; anything else throws
+};
+
 struct FusedLayout {
   uint32_t hidden = 128, heads = 1;
   uint32_t expand = 0, contractWeights = 0, inputAdapter = 0, ffnCosSkip = 0, qkv = 0, relative = 0, scale = 0,
@@ -37,8 +51,6 @@ FusedLayout postFusedLayout();
 
 class Graph {
  public:
-  static constexpr uint32_t kBlockCount = 71;   // blocks 0..70; the graph's stage boundaries are hard-coded
-
   struct Options {
     bool captureBoundaries = false;  // copy every block/transition output for parity checks
     bool captureIntermediates = false;  // also copy the intra-block tensors (FFN, QKV, attention)
@@ -55,9 +67,10 @@ class Graph {
   const Geometry& geometry() const { return geometry_; }
   // Whether consecutive launches are linked by device counters instead of barriers (docs/execution.md).
   bool chained() const { return routes_.chain || routes_.vitChain; }
-  // The stored outputs a boundary fixture can hold references for, in graph order: blocks 0-69 and the five encoder
-  // stage transitions. Block 70 feeds the head on chip; the pooled-* captures have no reference counterpart.
-  static const std::vector<std::string>& referenceBoundaryNames();
+  // The stored outputs a boundary fixture can hold references for, in graph order: every block before the post one
+  // (0-69, 0-29 in the small network) and the five encoder stage transitions. The post block feeds the head on chip;
+  // the pooled-* captures have no reference counterpart.
+  static std::vector<std::string> referenceBoundaryNames(uint32_t blockCount);   // 71, or 31 for the small network
 
   Activation* allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format);
 
@@ -129,6 +142,7 @@ class Graph {
   Kernels& kernels_;
   Geometry geometry_;
   Options options_;
+  Topology topology_;
   std::vector<std::unique_ptr<Activation>> activations_;
   std::map<std::string, Activation*> allocationsByKey_;
   std::set<std::string> usedThisRecord_;

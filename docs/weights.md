@@ -7,10 +7,10 @@ gap between "how the weights are stored" and "what a cooperative-matrix load wan
 
 `manifest.json` holds:
 
-* `totals.blockCount`: 71;
+* `totals.blockCount`: 71 (31 for the small network of build 310.9.16);
 * `stages[]`: eleven files of packed E4M3 bytes (`id`, `file`, `packedByteLength`, `sha256`), verified on load
   unless `--no-verify`;
-* `tensors[]`: 153 records, `blockN.layerM.parameter`, each a `(stage, stageOffset, byteLength)` slice.
+* `tensors[]`: 153 records (77 in the small network), `blockN.layerM.parameter`, each a `(stage, stageOffset, byteLength)` slice.
 
 One record holds a whole layer: its weight matrices, its per-channel f16 scale vectors, its attention prior and
 its per-head f32 scales, laid end to end. `FusedLayout` in `nr_graph.cpp` is that layout; every offset in it is
