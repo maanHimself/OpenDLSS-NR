@@ -136,7 +136,8 @@ class Kernels {
   static uint32_t vitGemmSignals(uint32_t rows, uint32_t N);   // chain signals of a gemmv launch: one per published tile
   void fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& args);
 
-  // Split-K partial sums (one fixed scratch: launches already recorded hold its address).
+  // Split-K partial sums (one fixed scratch per recorded graph: launches already recorded hold its address;
+  // releaseScratch() between graphs).
   vk::Buffer splitScratch_{};
   VkDeviceSize splitScratchBytes_ = 0;
 
@@ -252,6 +253,9 @@ class Kernels {
   const std::map<std::string, vk::Pipeline>& pipelines() const { return pipelines_; }
   // Replace the SiLU table (65536 f16 codes indexed by f16 input bits).
   void setSiluTable(const std::vector<uint16_t>& table);
+  // Releases the split-K scratch: the next recording sizes it again for its own shapes. Only while no recording
+  // that used it is kept or pending (they hold its address).
+  void releaseScratch();
 
  private:
   // requiredSubgroupSize 0: no subgroup requirement (kernels without subgroup operations and a workgroup that is not a

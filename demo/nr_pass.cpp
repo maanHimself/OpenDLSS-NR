@@ -153,6 +153,7 @@ void NrPass::destroySized() {
   }
   features_ = nullptr;
   graph_.reset();   // frees the activations
+  kernels_->releaseScratch();   // the next graph sizes the split-K scratch for its own shapes
 }
 
 void NrPass::fallBackToBarriers() {
