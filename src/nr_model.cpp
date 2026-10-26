@@ -73,52 +73,64 @@ uint32_t tiledToken(uint32_t token) {
 }  // namespace
 
 Model::Model(vk::Context& context, const std::string& directory, bool verifyHashes) : context_(context) {
-  json::Value manifest = json::parse(readText(directory + "/manifest.json"));
-  blockCount_ = (uint32_t)manifest["totals"]["blockCount"].integer();
-  for (const json::Value& stage : manifest["stages"].array) {
-    Stage loaded;
-    loaded.id = stage["id"].str();
-    loaded.bytes = readBinary(directory + "/model/" + stage["file"].str());
-    if (loaded.bytes.size() != (size_t)stage["packedByteLength"].integer())
-      throw std::runtime_error("stage size mismatch: " + loaded.id);
-    if (verifyHashes) {
-      std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size());
-      if (digest != stage["sha256"].str()) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
+  // A throw destroys what was made so far (the destructor does not run for a constructor that throws).
+  try {
+    json::Value manifest = json::parse(readText(directory + "/manifest.json"));
+    blockCount_ = (uint32_t)manifest["totals"]["blockCount"].integer();
+    for (const json::Value& stage : manifest["stages"].array) {
+      Stage loaded;
+      loaded.id = stage["id"].str();
+      loaded.bytes = readBinary(directory + "/model/" + stage["file"].str());
+      if (loaded.bytes.size() != (size_t)stage["packedByteLength"].integer())
+        throw std::runtime_error("stage size mismatch: " + loaded.id);
+      if (verifyHashes) {
+        std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size());
+        if (digest != stage["sha256"].str()) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
+      }
+      stages_.push_back(std::move(loaded));
     }
-    stages_.push_back(std::move(loaded));
-  }
-  for (const json::Value& entry : manifest["tensors"].array) {
-    Tensor tensor;
-    tensor.name = entry["name"].str();
-    tensor.block = (int)entry["block"].integer();
-    tensor.layer = (int)entry["layer"].integer();
-    tensor.parameter = entry["parameter"].str();
-    tensor.stage = entry["stage"].str();
-    tensor.stageOffset = (uint32_t)entry["stageOffset"].integer();
-    tensor.byteLength = (uint32_t)entry["byteLength"].integer();
-    const Stage* stage = nullptr;
-    for (const Stage& candidate : stages_) if (candidate.id == tensor.stage) stage = &candidate;
-    if (!stage) throw std::runtime_error("tensor references unknown stage " + tensor.stage);
-    if ((size_t)tensor.stageOffset + tensor.byteLength > stage->bytes.size())
-      throw std::runtime_error("tensor exceeds stage " + tensor.name);
-    tensor.bytes = stage->bytes.data() + tensor.stageOffset;
-    // Raw bytes on the GPU for per-column aux vectors (padded to 4 bytes).
-    size_t padded = (tensor.byteLength + 3) & ~3u;
-    std::vector<uint8_t> paddedBytes(padded, 0);
-    memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
-    tensor.raw = context_.createBuffer(padded, false, "tensor raw");
-    context_.upload(tensor.raw, paddedBytes.data(), padded);
-    tensors_[tensor.name] = std::move(tensor);
-  }
-  for (uint32_t k = 0; k < 64; ++k) {
-    if (inversePackedInputIndex(packedInputIndex(k)) != k)
-      throw std::runtime_error("chained index permutation is not invertible");
+    for (const json::Value& entry : manifest["tensors"].array) {
+      Tensor tensor;
+      tensor.name = entry["name"].str();
+      tensor.block = (int)entry["block"].integer();
+      tensor.layer = (int)entry["layer"].integer();
+      tensor.parameter = entry["parameter"].str();
+      tensor.stage = entry["stage"].str();
+      tensor.stageOffset = (uint32_t)entry["stageOffset"].integer();
+      tensor.byteLength = (uint32_t)entry["byteLength"].integer();
+      const Stage* stage = nullptr;
+      for (const Stage& candidate : stages_) if (candidate.id == tensor.stage) stage = &candidate;
+      if (!stage) throw std::runtime_error("tensor references unknown stage " + tensor.stage);
+      if ((size_t)tensor.stageOffset + tensor.byteLength > stage->bytes.size())
+        throw std::runtime_error("tensor exceeds stage " + tensor.name);
+      tensor.bytes = stage->bytes.data() + tensor.stageOffset;
+      // Raw bytes on the GPU for per-column aux vectors (padded to 4 bytes).
+      size_t padded = (tensor.byteLength + 3) & ~3u;
+      std::vector<uint8_t> paddedBytes(padded, 0);
+      memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
+      // Owned by tensors_ before anything that can throw, so a failure releases it.
+      const std::string name = tensor.name;
+      Tensor& stored = tensors_[name] = std::move(tensor);
+      stored.raw = context_.createBuffer(padded, false, "tensor raw");
+      context_.upload(stored.raw, paddedBytes.data(), padded);
+    }
+    for (uint32_t k = 0; k < 64; ++k) {
+      if (inversePackedInputIndex(packedInputIndex(k)) != k)
+        throw std::runtime_error("chained index permutation is not invertible");
+    }
+  } catch (...) {
+    release();
+    throw;
   }
 }
 
-Model::~Model() {
+Model::~Model() { release(); }
+
+void Model::release() {
   for (auto& [name, buffer] : matrices_) context_.destroyBuffer(buffer);
   for (auto& [name, tensor] : tensors_) context_.destroyBuffer(tensor.raw);
+  matrices_.clear();
+  tensors_.clear();
 }
 
 const Tensor& Model::tensor(int block, int layer, const std::string& parameter) const {

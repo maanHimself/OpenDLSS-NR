@@ -59,6 +59,7 @@ class Model {
   uint32_t blockCount() const { return blockCount_; }
 
  private:
+  void release();   // the destructor's cleanup (also a constructor's that throws)
   struct Stage {
     std::string id;
     std::vector<uint8_t> bytes;

@@ -167,6 +167,16 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
   volkLoadInstance(instance_);
   volkLoadDevice(device_);
+  // A throw destroys what was made so far on the application's device (no destructor runs for it).
+  try {
+    adopt();
+  } catch (...) {
+    release();
+    throw;
+  }
+}
+
+void Context::adopt() {
   VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
   VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
   VkPhysicalDeviceShaderSMBuiltinsPropertiesNV smBuiltins{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV};
@@ -275,7 +285,9 @@ void Context::initCommon() {
   staging_ = createBuffer(kStagingBytes, true, "staging");
 }
 
-Context::~Context() {
+Context::~Context() { release(); }
+
+void Context::release() {
   if (!device_) return;
   vkDeviceWaitIdle(device_);
   for (VkShaderModule module : modules_) vkDestroyShaderModule(device_, module, nullptr);
@@ -290,6 +302,7 @@ Context::~Context() {
     if (messenger_) vkDestroyDebugUtilsMessengerEXT(instance_, messenger_, nullptr);
     vkDestroyInstance(instance_, nullptr);
   }
+  device_ = VK_NULL_HANDLE;
 }
 
 uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required) {
@@ -312,20 +325,28 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | extra;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &result.buffer));
-  VkMemoryRequirements requirements;
-  vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
-  VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-  allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-  VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-  allocateInfo.pNext = &allocateFlags;
-  allocateInfo.allocationSize = requirements.size;
-  allocateInfo.memoryTypeIndex = findMemoryType(
-      requirements.memoryTypeBits,
-      hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &result.memory));
-  VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
-  if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
+  // A failure past here (no memory type, an allocation the device refuses) destroys the buffer.
+  try {
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
+    VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocateInfo.pNext = &allocateFlags;
+    allocateInfo.allocationSize = requirements.size;
+    allocateInfo.memoryTypeIndex = findMemoryType(
+        requirements.memoryTypeBits,
+        hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkDeviceMemory memory = VK_NULL_HANDLE;   // written only on success
+    VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &memory));
+    result.memory = memory;
+    VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
+    if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
+  } catch (...) {
+    destroyBuffer(result);
+    throw;
+  }
   return result;
 }
 

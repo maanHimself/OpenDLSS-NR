@@ -166,6 +166,8 @@ class Context {
   uint32_t smCount_ = 0;   // streaming multiprocessors (co-residency bound of spinning grids)
   bool captureStatistics_ = false;
   bool owned_ = true;
+  void adopt();
+  void release();   // the destructor's cleanup (also the adopting constructor's when it throws)
   std::string deviceName_;
   void initCommon();   // properties, memory types, command pool, layouts, pools, staging
   Buffer dummy_;
