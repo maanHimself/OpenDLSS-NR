@@ -72,6 +72,17 @@ uint32_t tiledToken(uint32_t token) {
 }
 }  // namespace
 
+uint32_t Tensor::auxOffset(uint32_t byteOffset, uint32_t bytes) const {
+  if (bytes == 0 || (size_t)byteOffset + bytes > byteLength)
+    throw std::runtime_error("aux read of " + std::to_string(bytes) + " bytes at " + std::to_string(byteOffset) +
+                             " is outside tensor " + name);
+  if (!compacted) return byteOffset;
+  for (const AuxRun& run : auxRuns)
+    if (byteOffset >= run.from && byteOffset + bytes <= run.to) return run.at + (byteOffset - run.from);
+  throw std::runtime_error("aux read of " + std::to_string(bytes) + " bytes at " + std::to_string(byteOffset) + " of tensor " +
+                           name + " overlaps bytes a matrix was built from (not in the compacted raw buffer)");
+}
+
 Model::Model(vk::Context& context, const std::string& directory, bool verifyHashes) : context_(context) {
   json::Value manifest = json::parse(readText(directory + "/manifest.json"));
   blockCount_ = (uint32_t)manifest["totals"]["blockCount"].integer();
@@ -121,6 +132,71 @@ Model::~Model() {
   for (auto& [name, tensor] : tensors_) context_.destroyBuffer(tensor.raw);
 }
 
+std::vector<bool>* Model::matrixSource(const Tensor& tensor) {
+  if (tensor.compacted) return nullptr;
+  std::vector<bool>& mask = matrixSource_[tensor.name];
+  if (mask.empty()) mask.resize(tensor.byteLength, false);
+  return &mask;
+}
+
+bool Model::compactAux() {
+  if (!tensors_.empty() && tensors_.begin()->second.compacted) return false;
+  struct Plan {
+    Tensor* tensor;
+    std::vector<Tensor::AuxRun> runs;
+    std::vector<uint8_t> bytes;
+    vk::Buffer buffer;
+  };
+  std::vector<Plan> plans;
+  for (auto& [name, tensor] : tensors_) {
+    Plan plan{&tensor, {}, {}, {}};
+    auto mask = matrixSource_.find(name);
+    auto used = [&](uint32_t i) { return mask != matrixSource_.end() && mask->second[i]; };
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < tensor.byteLength;) {
+      if (used(i)) { ++i; continue; }
+      uint32_t end = i;
+      while (end < tensor.byteLength && !used(end)) ++end;
+      at += (i - at) & 15u;   // at == i modulo 16: every kernel's alignment assumption on the offset still holds
+      plan.runs.push_back({i, end, at});
+      at += end - i;
+      i = end;
+    }
+    plan.bytes.assign(std::max<size_t>(4, (at + 3) & ~3u), 0);
+    for (const Tensor::AuxRun& run : plan.runs) memcpy(plan.bytes.data() + run.at, tensor.bytes + run.from, run.to - run.from);
+    plans.push_back(std::move(plan));
+  }
+  try {
+    for (Plan& plan : plans) {
+      plan.buffer = context_.createBuffer(plan.bytes.size(), false, "tensor raw (aux)");
+      context_.upload(plan.buffer, plan.bytes.data(), plan.bytes.size());
+    }
+  } catch (...) {
+    for (Plan& plan : plans) if (plan.buffer.buffer) context_.destroyBuffer(plan.buffer);
+    throw;
+  }
+  for (Plan& plan : plans) {
+    context_.destroyBuffer(plan.tensor->raw);
+    plan.tensor->raw = plan.buffer;
+    plan.tensor->auxRuns = std::move(plan.runs);
+    plan.tensor->compacted = true;
+  }
+  matrixSource_.clear();
+  return true;
+}
+
+size_t Model::rawBytes() const {
+  size_t total = 0;
+  for (const auto& [name, tensor] : tensors_) total += tensor.raw.size;
+  return total;
+}
+
+size_t Model::matrixBytes() const {
+  size_t total = 0;
+  for (const auto& [name, buffer] : matrices_) total += buffer.size;
+  return total;
+}
+
 const Tensor& Model::tensor(int block, int layer, const std::string& parameter) const {
   std::string name = "block" + std::to_string(block) + ".layer" + std::to_string(layer) + "." + parameter;
   auto it = tensors_.find(name);
@@ -139,11 +215,14 @@ std::vector<uint8_t> Model::fp8MatrixBytes(const Tensor& tensor, uint32_t byteOf
   if ((size_t)byteOffset + bytes > tensor.byteLength)
     throw std::runtime_error("FP8 matrix exceeds tensor " + key);
   std::vector<uint8_t> plain(bytes);
+  std::vector<bool>* source = matrixSource(tensor);
   for (uint32_t j = 0; j < K; ++j) {
     uint32_t k = swizzleK ? inversePackedInputIndex(j) : j;
     for (uint32_t n = 0; n < Nmatrix; ++n) {
       const uint32_t sourceColumn = columnSource ? (*columnSource)[n] : n;
-      uint8_t code = tensor.bytes[byteOffset + packedWeightIndex(k, sourceColumn, Nmatrix)];
+      const size_t index = byteOffset + packedWeightIndex(k, sourceColumn, Nmatrix);
+      if (source) (*source)[index] = true;
+      uint8_t code = tensor.bytes[index];
       if ((code & 0x7f) == 0x7f) { code = 0; ++nanWeights_; }  // E4M3FN NaN decodes to 0 in the reference
       // The chained permutation stays within 32-groups, so it commutes with the batch split.
       uint32_t kk = j % batchK;
@@ -189,11 +268,13 @@ const vk::Buffer& Model::f16Matrix(const Tensor& tensor, uint32_t byteOffset, ui
   if (it != matrices_.end()) return it->second;
   if (K % 16) throw std::runtime_error("f16 matrix K must be a multiple of 16");
   std::vector<uint16_t> plain((size_t)K * paddedN, 0);
+  std::vector<bool>* source = matrixSource(tensor);
   for (uint32_t k = 0; k < K; ++k) {
     for (uint32_t n = 0; n < N; ++n) {
       uint32_t halfIndex = (byteOffset >> 1) + packedF16WeightIndex(k, n, N);
       const uint8_t* p = tensor.bytes + halfIndex * 2;
       if (halfIndex * 2 + 1 >= tensor.byteLength) throw std::runtime_error("f16 matrix exceeds tensor " + key);
+      if (source) (*source)[halfIndex * 2] = (*source)[halfIndex * 2 + 1] = true;
       plain[(size_t)k * paddedN + n] = (uint16_t)(p[0] | (p[1] << 8));
     }
   }
@@ -207,6 +288,7 @@ const vk::Buffer& Model::relativeBias(const Tensor& tensor, uint32_t relativeByt
   auto it = matrices_.find(key);
   if (it != matrices_.end()) return it->second;
   std::vector<uint16_t> prior((size_t)heads * 64 * 64);
+  std::vector<bool>* source = matrixSource(tensor);
   // Native stores the bias with both tokens in physical order; the kernels want the query in natural order (the
   // A rows of S = Q K^T) and the key in physical order (the B columns, which is how K / V are staged).
   for (uint32_t head = 0; head < heads; ++head) {
@@ -221,6 +303,7 @@ const vk::Buffer& Model::relativeBias(const Tensor& tensor, uint32_t relativeByt
         uint32_t halfIndex = tileOffset + laneOffset + fragment;
         uint32_t byteIndex = relativeByteOffset + head * 8192 + halfIndex * 2;
         if (byteIndex + 1 >= tensor.byteLength) throw std::runtime_error("relative bias exceeds tensor " + key);
+        if (source) (*source)[byteIndex] = (*source)[byteIndex + 1] = true;
         prior[((size_t)head * 64 + query) * 64 + physical] =
             (uint16_t)(tensor.bytes[byteIndex] | (tensor.bytes[byteIndex + 1] << 8));
       }

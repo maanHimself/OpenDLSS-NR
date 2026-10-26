@@ -473,6 +473,13 @@ int runParity(int argc, char** argv) {
     if (!ok) ++failures;
   };
 
+  // A first graph builds every matrix; then the raw tensor buffers keep only the bytes the kernels read through
+  // them (Model::compactAux), and every check below runs on the compacted model.
+  const size_t rawBefore = model.rawBytes();
+  const GraphRun uncompacted = runGraph(context, model, kernels, geometry, features, true, false, 1);
+  model.compactAux();
+  printf("tensor raw buffers: %.1f MiB, %.1f KiB after compaction (matrices %.1f MiB)\n", rawBefore / 1048576.0,
+         model.rawBytes() / 1024.0, model.matrixBytes() / 1048576.0);
   // The production schedule (no captures, chaining as configured) is what the head and output references are
   // compared against, resubmitted several times: its head must not change between submissions.
   const GraphRun production = runGraph(context, model, kernels, geometry, features, true, false, repeats);
@@ -480,6 +487,7 @@ int runParity(int argc, char** argv) {
          production.chained ? "counter chaining" : "barriers", production.dispatches, production.minGpuMs, repeats);
   printf("NaN weight codes replaced: %zu\n", model.nanWeightsReplaced());
   require(production.repeatable, ("head over " + std::to_string(repeats) + " production submissions").c_str());
+  require(production.head == uncompacted.head, "head before and after compacting the raw tensor buffers");
   // Chaining is scheduling, not arithmetic: the same graph with a barrier after every launch gives the same head.
   if (production.chained)
     require(runGraph(context, model, kernels, geometry, features, false, false, 1).head == production.head, "head with barriers instead of chaining");
@@ -590,6 +598,9 @@ int runBench(int argc, char** argv) {
     context.endAndSubmit(commands, true);
     checkChainTimeouts(kernels);
   }
+  const size_t rawBefore = model.rawBytes();
+  model.compactAux();   // every matrix is built: the raw buffers keep only what the kernels read through them
+  printf("tensor raw buffers: %.1f MiB, %.1f KiB after compaction\n", rawBefore / 1048576.0, model.rawBytes() / 1024.0);
   VkQueryPool queries = context.createTimestampPool(2);
   std::vector<double> samples;
   for (int frame = 0; frame < frames; ++frame) {

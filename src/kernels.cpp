@@ -214,7 +214,10 @@ bool Kernels::ptxQkvEnabled() {
   return enabled;
 }
 
-void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
+void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& args) {
+  // The scaled residual reads N halves of the aux tensor (every route); the offset is the compacted raw's.
+  GemmFp8Args a = args;
+  if (a.auxTensor && a.scaleResidual) a.auxByteOffset = a.auxTensor->auxOffset(a.auxByteOffset, 2 * a.N);
   check(a.input && a.input->format == Format::E4, "FP8 GEMM input must be E4M3");
   check(a.K % 32 == 0, "FP8 GEMM K must be a multiple of 32");
   check(a.output, "FP8 GEMM needs an output");
@@ -561,8 +564,9 @@ void Kernels::postBlend(VkCommandBuffer commands, const Activation& upsampleSour
   uint32_t count = quantizedOutput.rows * quantizedOutput.channels;
   vk::SpecConstants constants;
   constants.add(0, 3);
-  OpsPush push{count, quantizedOutput.channels, inWidth, inHeight, outWidth, outHeight, inputScaleByteOffset / 2,
-               skipScaleByteOffset / 2, 1};
+  OpsPush push{count, quantizedOutput.channels, inWidth, inHeight, outWidth, outHeight,
+               tensor.auxOffset(inputScaleByteOffset, 2 * quantizedOutput.channels) / 2,
+               tensor.auxOffset(skipScaleByteOffset, 2 * quantizedOutput.channels) / 2, 1};
   const vk::Buffer* bindings[vk::kGenericBindings] = {};
   bindings[2] = &upsampleSource.buffer;
   bindings[3] = &adapter.buffer;
@@ -585,7 +589,7 @@ void Kernels::upsampleResidual(VkCommandBuffer commands, const Activation& proje
   uint32_t count = output.rows * output.channels;
   vk::SpecConstants constants;
   constants.add(0, 4);
-  OpsPush push{count, output.channels, inWidth, inHeight, outWidth, outHeight, scaleByteOffset / 2, 0,
+  OpsPush push{count, output.channels, inWidth, inHeight, outWidth, outHeight, tensor.auxOffset(scaleByteOffset, 2 * output.channels) / 2, 0,
                rawOutput ? 1u : 0u};
   const vk::Buffer* bindings[vk::kGenericBindings] = {};
   bindings[1] = &projection.buffer;
@@ -660,7 +664,15 @@ bool Kernels::fusedBlock32IsPtx(const FusedBlock32Args& a) {
   return ptxBlock32Enabled() && a.w1Ptx && a.w2Ptx && !a.skip16 && !a.outF16;
 }
 
-void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) {
+void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& args) {
+  // Offsets into the compacted raw: the FFN and attention skip scales (32 halves each) and the one f32 attention
+  // scale always, the input blend scales on the upres and post variants, the adapter's on the post one.
+  FusedBlock32Args a = args;
+  a.ffnScaleByteOffset = a.tensor->auxOffset(a.ffnScaleByteOffset, 64);
+  a.attnScaleByteOffset = a.tensor->auxOffset(a.attnScaleByteOffset, 64);
+  a.attentionScaleByteOffset = a.tensor->auxOffset(a.attentionScaleByteOffset, 4);
+  if (a.lowRes || a.lowProjection) a.inputScaleByteOffset = a.tensor->auxOffset(a.inputScaleByteOffset, 64);
+  if (a.lowRes) a.adapterScaleByteOffset = a.tensor->auxOffset(a.adapterScaleByteOffset, 64);
   if (fusedBlock32IsPtx(a)) { fusedBlock32Ptx(commands, a); return; }
   check(!a.chainWait && !a.chainSignal && !a.chained, "the GLSL fused block does not implement counter chaining");
   check(a.features || (a.state && a.state->format == Format::E4 && a.state->channels == 32), "fused block state");
@@ -814,7 +826,8 @@ void Kernels::expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& a, con
   VkDeviceAddress pPrev = proj ? context_.deviceAddress(a.ffnPrev->buffer) : pA;
   VkDeviceAddress pWproj = proj ? context_.deviceAddress(*a.wproj) : pA;
   VkDeviceAddress pAuxPrev = proj ? context_.deviceAddress(a.auxTensorPrev->raw) : pAux;
-  uint32_t rows = a.rows, auxHalf = a.auxByteOffset / 2, auxAttnHalf = a.auxAttnByteOffset / 2;
+  uint32_t rows = a.rows, auxHalf = a.auxTensor->auxOffset(a.auxByteOffset, 2 * a.channels) / 2,
+           auxAttnHalf = proj ? a.auxTensorPrev->auxOffset(a.auxAttnByteOffset, 2 * a.channels) / 2 : 0;
   VkDeviceAddress pStateOut = a.stateOut ? context_.deviceAddress(a.stateOut->buffer) : pA;
   uint32_t storeState = a.stateOut ? 1u : 0u;
   VkDeviceAddress pWaitRows = chain.waitRows, pWaitBands = chain.waitBands, pSignal = chain.signal;
@@ -833,6 +846,7 @@ void Kernels::expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& a, con
 void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, const vk::Buffer& weights, uint32_t Nmatrix,
                            const Tensor& tensor, uint32_t scaleByteOffset, const vk::Buffer& prior, Activation& attended,
                            uint32_t width, uint32_t height, uint32_t heads, uint32_t shiftX, uint32_t shiftY, const Chain& chain) {
+  scaleByteOffset = tensor.auxOffset(scaleByteOffset, 4 * heads);   // the per-head f32 scales, in the compacted raw
   check(input.format == Format::E4 && input.channels == heads * 32, "qkv attention input");
   check(Nmatrix == heads * 96, "qkv attention weight columns");
   check(attended.format == Format::E4 && attended.channels == heads * 32, "qkv attention output");
@@ -878,6 +892,7 @@ void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, co
 
 void Kernels::windowNormalize(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor,
                               uint32_t scaleByteOffset, Activation& normalized, uint32_t tokens, uint32_t heads) {
+  scaleByteOffset = tensor.auxOffset(scaleByteOffset, 4 * heads);   // the per-head f32 scales, in the compacted raw
   check(qkv.format == Format::F16 && normalized.format == Format::E4, "normalize formats");
   check(qkv.channels == heads * 96 && normalized.channels == heads * 96, "normalize channels");
   struct Push { uint32_t tokens, heads, channels, scaleWordOffset; } push{tokens, heads, heads * 32, scaleByteOffset / 4};
@@ -929,6 +944,7 @@ bool Kernels::globalAttentionStreamPtx(uint32_t paddedTokens) const {
 
 void Kernels::globalNormalizePtx(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,
                                  Activation& normalized, uint32_t tokens, uint32_t paddedTokens, uint32_t heads, const Chain* chain) {
+  scaleByteOffset = tensor.auxOffset(scaleByteOffset, 4 * heads);   // the per-head f32 scales, in the compacted raw
   check(qkv.format == Format::F16 && qkv.channels == heads * 96 && normalized.format == Format::E4 &&
             (VkDeviceSize)normalized.allocRows * normalized.channels >= (VkDeviceSize)3 * heads * paddedTokens * 32,
         "global normalize (PTX) formats");
@@ -964,6 +980,7 @@ void Kernels::globalAttentionStream(VkCommandBuffer commands, const Activation& 
 void Kernels::globalAttention(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor, uint32_t scaleByteOffset,
                               Activation& attended, uint32_t tokens, uint32_t paddedTokens, uint32_t heads,
                               const Activation* normalized, const Chain* chain) {
+  scaleByteOffset = tensor.auxOffset(scaleByteOffset, 4 * heads);   // the per-head f32 scales, in the compacted raw
   check(qkv.format == Format::F16 && qkv.channels == heads * 96 && attended.format == Format::E4 &&
             attended.channels == heads * 32, "global attention formats");
   check(paddedTokens % 64 == 0 && paddedTokens >= tokens && qkv.allocRows >= tokens, "global attention tokens");
@@ -1003,6 +1020,7 @@ void Kernels::globalAttention(VkCommandBuffer commands, const Activation& qkv, c
 
 void Kernels::globalNormalize(VkCommandBuffer commands, const Activation& qkv, const Tensor& tensor,
                               uint32_t scaleByteOffset, Activation& normalized, uint32_t tokens, uint32_t heads) {
+  scaleByteOffset = tensor.auxOffset(scaleByteOffset, 4 * heads);   // the per-head f32 scales, in the compacted raw
   check(qkv.format == Format::F16 && normalized.format == Format::E4, "global normalize formats");
   struct Push { uint32_t tokens, heads, channels, scaleWordOffset; } push{tokens, heads, heads * 32, scaleByteOffset / 4};
   const vk::Buffer* bindings[vk::kGenericBindings] = {};

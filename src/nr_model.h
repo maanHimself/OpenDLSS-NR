@@ -20,6 +20,14 @@ struct Tensor {
   uint32_t byteLength = 0;
   const uint8_t* bytes = nullptr;  // into the owning stage
   vk::Buffer raw;                  // raw packed bytes on the GPU (aux vectors, scales)
+  // After Model::compactAux, raw holds only the record's bytes no matrix was built from: each run of them
+  // [from, to) at raw offset `at`, which keeps the record offset's alignment modulo 16.
+  struct AuxRun { uint32_t from = 0, to = 0, at = 0; };
+  std::vector<AuxRun> auxRuns;
+  bool compacted = false;
+  // The offset in raw of the record's bytes [byteOffset, byteOffset + bytes) a kernel reads through raw; throws
+  // when they are not all in raw (a read of bytes a matrix was built from, compacted away).
+  uint32_t auxOffset(uint32_t byteOffset, uint32_t bytes) const;
 };
 
 // Native within-32 chained activation index used by every FP8 GEMM A operand.
@@ -56,6 +64,15 @@ class Model {
   const vk::Buffer& relativeBias(const Tensor& tensor, uint32_t relativeByteOffset, uint32_t heads);
 
   size_t nanWeightsReplaced() const { return nanWeights_; }
+  // Drops from every tensor's raw buffer the bytes a matrix was built from (fp8Matrix, fp8MatrixPermuted,
+  // f16Matrix, relativeBias): the kernels read those only from the matrices' own buffers. Call once every matrix
+  // the graph uses is built and no recorded work that uses the old raw buffers can still run; raw offsets go
+  // through Tensor::auxOffset. A matrix built later is made from the host copy as before. Returns false when
+  // already compacted.
+  bool compactAux();
+  // GPU bytes of the raw buffers and of the matrices' buffers.
+  size_t rawBytes() const;
+  size_t matrixBytes() const;
   uint32_t blockCount() const { return blockCount_; }
 
  private:
@@ -67,6 +84,9 @@ class Model {
   std::vector<Stage> stages_;
   std::map<std::string, Tensor> tensors_;
   std::map<std::string, vk::Buffer> matrices_;
+  // Until compactAux: per tensor, the record's bytes a matrix was built from.
+  std::map<std::string, std::vector<bool>> matrixSource_;
+  std::vector<bool>* matrixSource(const Tensor& tensor);   // null once compacted
   size_t nanWeights_ = 0;
   uint32_t blockCount_ = 0;
 };

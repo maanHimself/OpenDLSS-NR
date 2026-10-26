@@ -116,6 +116,9 @@ void NrPass::createSized(uint32_t width, uint32_t height) {
     graph_->record(commands, *features_);
     context_->endAndSubmit(commands, true);
   }
+  // every matrix is built and nothing recorded with the whole raw tensor buffers can still run: keep only the bytes
+  // the kernels read through them (a no-op after the first size)
+  model_->compactAux();
   // ---- images (the scene color and the velocity are the renderer's; views onto them are made at the first record)
   // (TRANSFER_DST: each is cleared once below)
   sceneMotion_ = createImage(width, height, VK_FORMAT_R16G16B16A16_SFLOAT,
