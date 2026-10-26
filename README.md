@@ -41,6 +41,13 @@ powershell -File scripts\build_filament.ps1         # once, for the demo: third_
 powershell -File scripts\build_demo.ps1             # build\demo\dlss5-demo.exe
 ```
 
+On Linux, the command-line tool only (the demo is Windows only):
+
+```
+scripts/fetch_tools.sh                              # once: tools/ (glslang, Vulkan-Headers, volk)
+scripts/build.sh                                    # shaders, PTX, build/dlss5vk
+```
+
 ```
 build\dlss5vk.exe bench   --model <dir> --width 768 --height 768
 build\dlss5vk.exe profile --model <dir> --width 768 --height 768   # per-dispatch timings
@@ -85,7 +92,7 @@ reference captures were made with.
 
 ## Requirements
 
-- Windows, an NVIDIA Ada (or newer) GPU and a driver exposing `VK_KHR_cooperative_matrix`,
+- Windows or Linux (Linux: the command-line tool, not the demo), an NVIDIA Ada (or newer) GPU and a driver exposing `VK_KHR_cooperative_matrix`,
   `VK_NV_cooperative_matrix2`, `VK_EXT_shader_float8` and `VK_NV_cuda_kernel_launch`.
 - Visual Studio 2022 or later with the C++ x64 toolset (any edition or the Build Tools; found through vswhere,
   or set `VCVARS64` to your `vcvars64.bat`), git, Python 3 for the PTX generators, and Node.js + npm and
@@ -93,6 +100,9 @@ reference captures were made with.
 - The portable toolchain under `tools/` (git-ignored): `scripts\fetch_tools.ps1` downloads glslang 16.6.0,
   Vulkan-Headers v1.4.363, volk (pinned tags), CMake 3.31 and Ninja 1.13. No Vulkan SDK install is needed.
   `-Npm` also installs the scene converter's modules into `tools\gltf`.
+- On Linux: GCC with C++20 (tested with GCC 15.2), curl, unzip, git and Python 3. `scripts/fetch_tools.sh`
+  downloads the same glslang, Vulkan-Headers and volk into `tools/`; `scripts/build_shaders.sh` generates the same
+  shaders and PTX as `build_shaders.ps1`.
 - For the demo: Filament v1.77.0, cloned and patched by `scripts\fetch_filament.ps1` and built once by
   `scripts\build_filament.ps1` (both git-ignored; about 15 minutes and 6 GB of build tree, placed in
   `%LOCALAPPDATA%\dlss5-vulkan` or `DLSS5_FILAMENT_BUILD_DIR`; `DLSS5_BUILD_JOBS` caps the parallel

@@ -63,6 +63,13 @@ struct GemmF16Args {
   uint32_t rows = 0, K = 0, N = 0;
 };
 
+struct KernelChain {
+  VkDeviceAddress waitRows = 0; uint32_t waitExpected = 0, waitShiftY = 0;   // window-row counters (attention output)
+  VkDeviceAddress waitBands = 0; uint32_t waitMul = 1, waitGroupRows = 64;   // row-band counters (FFN / projection output), signals per row group, the producer's rows per workgroup
+  VkDeviceAddress signal = 0;                                                // counters to increment
+  bool chained = false;                                                      // no barrier after this launch
+};
+
 class Kernels {
  public:
   Kernels(vk::Context& context, const std::string& shaderDirectory);
@@ -181,12 +188,7 @@ class Kernels {
   struct ChainTimeouts { uint32_t waits = 0; std::string counter; };   // counter: where the first stuck wait was
   ChainTimeouts chainTimeouts() const;
   void resetChainTimeouts();
-  struct Chain {
-    VkDeviceAddress waitRows = 0; uint32_t waitExpected = 0, waitShiftY = 0;   // window-row counters (attention output)
-    VkDeviceAddress waitBands = 0; uint32_t waitMul = 1, waitGroupRows = 64;   // row-band counters (FFN / projection output), signals per row group, the producer's rows per workgroup
-    VkDeviceAddress signal = 0;                                                // counters to increment
-    bool chained = false;                                                      // no barrier after this launch
-  };
+  using Chain = KernelChain;   // namespace scope: GCC rejects Chain() default arguments for a nested struct with member initializers
   struct ExpertFfnArgs {
     const Activation* input = nullptr;     // block state, E4 [rows][channels]; also the skip
     const vk::Buffer* w1 = nullptr;        // tile-major [expert][channels/32][128][32]
