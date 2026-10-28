@@ -329,6 +329,54 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
   return result;
 }
 
+// A buffer as createBuffer makes a device-local one (storage, transfer and device-address usage), without memory.
+static VkBuffer makeBuffer(VkDevice device, VkDeviceSize size) {
+  VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  info.size = size;
+  info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VK_CHECK(vkCreateBuffer(device, &info, nullptr, &buffer));
+  return buffer;
+}
+
+VkMemoryRequirements Context::bufferRequirements(VkDeviceSize size) {
+  VkBuffer probe = makeBuffer(device_, std::max<VkDeviceSize>(size, 16));
+  VkMemoryRequirements requirements;
+  vkGetBufferMemoryRequirements(device_, probe, &requirements);
+  vkDestroyBuffer(device_, probe, nullptr);
+  return requirements;
+}
+
+VkDeviceMemory Context::allocateDeviceMemory(VkDeviceSize size, uint32_t memoryTypeBits) {
+  VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocateInfo.pNext = &allocateFlags;
+  allocateInfo.allocationSize = size;
+  allocateInfo.memoryTypeIndex = findMemoryType(memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &memory));
+  return memory;
+}
+
+void Context::freeMemory(VkDeviceMemory memory) {
+  if (memory) vkFreeMemory(device_, memory, nullptr);
+}
+
+Buffer Context::createBufferAt(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, const char* label) {
+  Buffer result;
+  result.size = std::max<VkDeviceSize>(size, 16);
+  result.label = label;
+  result.buffer = makeBuffer(device_, result.size);
+  if (const VkResult bound = vkBindBufferMemory(device_, result.buffer, memory, offset); bound != VK_SUCCESS) {
+    vkDestroyBuffer(device_, result.buffer, nullptr);
+    VK_CHECK(bound);
+  }
+  return result;   // `memory` stays null: the block is the caller's
+}
+
 void Context::destroyBuffer(Buffer& buffer) {
   if (buffer.mapped) vkUnmapMemory(device_, buffer.memory);
   if (buffer.buffer) vkDestroyBuffer(device_, buffer.buffer, nullptr);
@@ -485,6 +533,7 @@ VkDescriptorSet Context::allocateSet(const Buffer* const bindings[kGenericBindin
   VkWriteDescriptorSet writes[kGenericBindings];
   for (uint32_t index = 0; index < kGenericBindings; ++index) {
     const Buffer* buffer = bindings[index] ? bindings[index] : &dummy_;
+    if (useTracker_ && bindings[index]) useTracker_(buffer->buffer, barriers_);
     infos[index] = {buffer->buffer, offsets ? offsets[index] : 0,
                     ranges && ranges[index] ? ranges[index] : VK_WHOLE_SIZE};
     writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -534,6 +583,7 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
 }
 
 void Context::computeBarrier(VkCommandBuffer commands) {
+  ++barriers_;
   // Compute -> compute only. Including the transfer stages here made NVIDIA flush
   // caches between every dispatch (tens of microseconds per barrier once L2 is dirty).
   VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -549,6 +599,7 @@ void Context::computeBarrier(VkCommandBuffer commands) {
 
 // Captures and uploads only.
 void Context::transferBarrier(VkCommandBuffer commands) {
+  ++barriers_;
   VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
   barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
   barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -584,7 +635,22 @@ std::vector<double> Context::readTimestampsMs(VkQueryPool pool, uint32_t count) 
 
 namespace vk {
 
+void Context::cmdCopyBuffer(VkCommandBuffer commands, const Buffer& source, const Buffer& target,
+                            const VkBufferCopy& region) {
+  if (useTracker_) {
+    useTracker_(source.buffer, barriers_);
+    useTracker_(target.buffer, barriers_);
+  }
+  vkCmdCopyBuffer(commands, source.buffer, target.buffer, 1, &region);
+}
+
+void Context::cmdFillZero(VkCommandBuffer commands, const Buffer& target) {
+  if (useTracker_) useTracker_(target.buffer, barriers_);
+  vkCmdFillBuffer(commands, target.buffer, 0, VK_WHOLE_SIZE, 0);
+}
+
 VkDeviceAddress Context::deviceAddress(const Buffer& buffer) const {
+  if (useTracker_) useTracker_(buffer.buffer, barriers_);
   VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
   info.buffer = buffer.buffer;
   return vkGetBufferDeviceAddress(device_, &info);

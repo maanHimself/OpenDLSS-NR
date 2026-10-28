@@ -113,7 +113,9 @@ void NrPass::createSized(uint32_t width, uint32_t height) {
     // the driver compiles / loads every pipeline and CUDA module before the first real frame
     context_->fillZero(features_->buffer);
     VkCommandBuffer commands = context_->beginCommands();
+    graph_->trackLifetimes(true);
     graph_->record(commands, *features_);
+    graph_->trackLifetimes(false);
     context_->endAndSubmit(commands, true);
   }
   // ---- images (the scene color and the velocity are the renderer's; views onto them are made at the first record)
@@ -139,6 +141,8 @@ void NrPass::createSized(uint32_t width, uint32_t height) {
     context_->endAndSubmit(commands, true);
   }
   color_ = ExternalView{}; velocity_ = ExternalView{};
+  // nothing recorded runs any more: the activations share memory by lifetime (freed with the graph)
+  graph_->shareActivations({features_});
   for (auto& w : queriesWritten_) w = false;
   framesSinceReset_ = 0;
 }

@@ -51,6 +51,8 @@ class Graph {
   void record(VkCommandBuffer commands, const Activation& inputFeatures);
 
   const Activation& head() const { return *head_; }  // f32 [full rows][4]
+  // The captures (Options::captureBoundaries), by name. Read after a run, outside the graph: like the head, they
+  // keep their own buffers when the activations share memory by lifetime.
   const std::map<std::string, Activation*>& boundaries() const { return boundaries_; }
   const Geometry& geometry() const { return geometry_; }
   // Whether consecutive launches are linked by device counters instead of barriers (docs/execution.md).
@@ -60,6 +62,22 @@ class Graph {
   static const std::vector<std::string>& referenceBoundaryNames();
 
   Activation* allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format);
+
+  // Activation memory. Each activation has its own allocation until shareActivations. Record once (a warm-up)
+  // between trackLifetimes(true) and trackLifetimes(false): every use of an activation's buffer is noted with the
+  // barrier interval it falls in. A barrier orders every launch before it against every one after, chained or not,
+  // so two activations whose intervals do not overlap can share bytes. Every use counts, the transfers included (the
+  // captures' copies): the recording reports each through the context's use tracker (vk::Context::setUseTracker),
+  // so it binds, takes addresses, copies and fills only through the context. An activation whose use went
+  // unreported would be taken for unused (and given a 16-byte buffer) or for dead before that use.
+  void trackLifetimes(bool on);
+  // After the tracked recording has run, with nothing recorded still pending: the activations it used move into one
+  // device-local block, largest first, each at the lowest offset clear of every activation alive in an overlapping
+  // interval; the ones it never touched (allocated for routes it did not take) get a 16-byte buffer. The head and
+  // `keep` (the input features, written outside the graph) keep their own buffers, and so do the captures (read
+  // after the run). The block starts zeroed, as the activations did, and is freed with the graph. Returns the bytes
+  // of the moved activations before, and of the block.
+  std::pair<VkDeviceSize, VkDeviceSize> shareActivations(std::initializer_list<const Activation*> keep = {});
 
  private:
   // Window phases. Every resolution level runs its own four-phase cycle of half-window shifts; the phase advances
@@ -135,6 +153,9 @@ class Graph {
   std::map<std::string, Activation*> boundaries_;
   Activation* head_ = nullptr;
   Activation* inputHalf_ = nullptr;
+  std::map<VkBuffer, std::pair<uint32_t, uint32_t>> lifetimes_;   // buffer -> first and last barrier interval
+  VkDeviceMemory activationBlock_ = VK_NULL_HANDLE;                // shareActivations
+  void rebind(Activation& activation, vk::Buffer buffer);         // destroys the buffer it had
 };
 
 }  // namespace nr

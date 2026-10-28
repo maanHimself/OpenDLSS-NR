@@ -150,6 +150,8 @@ only the PTX kernels take part in it.
 - `DLSS5VK_NO_FUSE_PRE`, `POOL`, `UPRES` and `POST` set to 1 drop one fusion each.
 - `DLSS5VK_CHAIN_MASK` is a bit mask: 1 expert stages, 2 c32 blocks, 4 split GEMMs. Default 3.
 - `DLSS5VK_DEFER_MAX` is the widest stage whose projection GEMM is fused. Default 128.
+- `DLSS5VK_SHARED_ACTIVATIONS=0` keeps every activation in its own allocation instead of sharing memory by
+  lifetime (`Graph::shareActivations`; `bench` and `parity` share by default, the demo always does).
 - `DLSS5VK_VALIDATION=1` runs under the Khronos validation layer (refused if it is not installed: a Vulkan SDK, or
   `VK_LAYER_PATH` at a build of Vulkan-ValidationLayers); an error it reports fails the run. `DLSS5VK_DEBUG=1`
   only prints the driver's own messages (the PTX compiler's among them). `DLSS5VK_LIST_EXTENSIONS=1` lists

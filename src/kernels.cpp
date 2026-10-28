@@ -134,7 +134,7 @@ VkDeviceAddress Kernels::tileCounters(uint32_t count) {
 // Consumers spin on these. A stale count starts one early.
 void Kernels::resetSync(VkCommandBuffer commands) {
   if (syncBuffer_.buffer == VK_NULL_HANDLE) syncAddress(0, kSyncBands);
-  vkCmdFillBuffer(commands, syncBuffer_.buffer, 0, VK_WHOLE_SIZE, 0);
+  context_.cmdFillZero(commands, syncBuffer_);
   context_.transferBarrier(commands);
   chainLaunches_.clear();
 }

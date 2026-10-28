@@ -71,6 +71,12 @@ static bool fusedBlocksEnabled() {
   return !(unfused && !strcmp(unfused, "1"));
 }
 
+// DLSS5VK_SHARED_ACTIVATIONS=0 keeps every activation in its own allocation (Graph::shareActivations).
+static bool sharedActivationsEnabled() {
+  const char* shared = getenv("DLSS5VK_SHARED_ACTIVATIONS");
+  return !(shared && !strcmp(shared, "0"));
+}
+
 // ---- parity ----------------------------------------------------------------------------------------------------
 // A fixture declares the comparisons it exists for ("checks") and carries one reference per comparison. The whole
 // declaration is validated before the GPU runs and nothing is ever dropped from a count: a declared check that
@@ -377,6 +383,17 @@ GraphRun runGraph(vk::Context& context, nr::Model& model, nr::Kernels& kernels, 
     options.fusedBlocks = fusedBlocksEnabled();
     nr::Graph graph(context, model, kernels, geometry, options);
     run.chained = graph.chained();
+    if (sharedActivationsEnabled()) {
+      // a tracked warm-up, then the activations share memory by lifetime: every submission below runs shared
+      context.resetDescriptorPool();
+      VkCommandBuffer commands = context.beginCommands();
+      graph.trackLifetimes(true);
+      graph.record(commands, features);
+      graph.trackLifetimes(false);
+      context.endAndSubmit(commands, true);
+      checkChainTimeouts(kernels);
+      graph.shareActivations();
+    }
     VkQueryPool queries = context.createTimestampPool(2);
     for (int submission = 0; submission < submissions; ++submission) {
       context.resetDescriptorPool();
@@ -583,14 +600,21 @@ int runBench(int argc, char** argv) {
   std::vector<float> synthetic((size_t)fullRows * 16);
   for (size_t i = 0; i < synthetic.size(); ++i) synthetic[i] = num::roundF16(std::sin(i * 0.0017f) * 0.125f);
   context.upload(features->buffer, synthetic.data(), synthetic.size() * 4);
-  // Warm compile.
+  // Warm compile (tracked: the activations then share memory by lifetime).
   {
     VkCommandBuffer commands = context.beginCommands();
+    graph.trackLifetimes(true);
     graph.record(commands, *features);
+    graph.trackLifetimes(false);
     context.endAndSubmit(commands, true);
     checkChainTimeouts(kernels);
   }
   VkQueryPool queries = context.createTimestampPool(2);
+  if (sharedActivationsEnabled()) {
+    const auto [before, block] = graph.shareActivations({features});
+    printf("activations: %.1f MiB in their own allocations, %.1f MiB shared by lifetime\n", before / 1048576.0,
+           block / 1048576.0);
+  }
   std::vector<double> samples;
   for (int frame = 0; frame < frames; ++frame) {
     context.resetDescriptorPool();

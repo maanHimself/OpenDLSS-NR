@@ -168,6 +168,86 @@ Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometr
 
 Graph::~Graph() {
   for (auto& activation : activations_) context_.destroyBuffer(activation->buffer);
+  context_.freeMemory(activationBlock_);   // nothing is bound to it now
+}
+
+// The lifetimes are only as complete as the reports: every use the recording makes of a buffer, transfers (the
+// captures' copies, fills) included, must reach the use tracker (vk::Context::cmdCopyBuffer, cmdFillZero,
+// allocateSet, deviceAddress), or shareActivations takes that buffer for unused or for dead too early.
+void Graph::trackLifetimes(bool on) {
+  if (!on) {
+    context_.setUseTracker(nullptr);
+    return;
+  }
+  lifetimes_.clear();
+  context_.setUseTracker([this](VkBuffer buffer, uint32_t epoch) {
+    auto [it, inserted] = lifetimes_.try_emplace(buffer, epoch, epoch);
+    if (!inserted) {
+      it->second.first = std::min(it->second.first, epoch);
+      it->second.second = std::max(it->second.second, epoch);
+    }
+  });
+}
+
+void Graph::rebind(Activation& activation, vk::Buffer buffer) {
+  context_.destroyBuffer(activation.buffer);
+  activation.buffer = buffer;
+}
+
+std::pair<VkDeviceSize, VkDeviceSize> Graph::shareActivations(std::initializer_list<const Activation*> keep) {
+  if (activationBlock_) throw std::runtime_error("shareActivations: already shared");
+  if (lifetimes_.empty()) throw std::runtime_error("shareActivations: no recording was tracked (trackLifetimes)");
+  struct Placement {
+    Activation* activation;
+    uint32_t first, last;
+    VkDeviceSize offset, bytes;
+  };
+  std::vector<Placement> mine;
+  VkDeviceSize before = 0, block = 0, alignment = 256;
+  uint32_t types = ~0u;
+  for (auto& owned : activations_) {
+    Activation* a = owned.get();
+    if (a == head_ || std::find(keep.begin(), keep.end(), a) != keep.end()) continue;
+    // The captures are read after the run, like the head. Their copies' sources are placed like any activation,
+    // alive until the copy reads them (a use the tracked recording reported).
+    if (std::any_of(boundaries_.begin(), boundaries_.end(), [a](const auto& c) { return c.second == a; })) continue;
+    before += a->buffer.size;
+    auto it = lifetimes_.find(a->buffer.buffer);
+    if (it == lifetimes_.end()) {
+      rebind(*a, context_.createBuffer(16, false, a->label.c_str()));
+      continue;
+    }
+    const VkMemoryRequirements r = context_.bufferRequirements(a->buffer.size);
+    alignment = std::max(alignment, r.alignment);
+    types &= r.memoryTypeBits;
+    mine.push_back({a, it->second.first, it->second.second, 0, r.size});
+  }
+  lifetimes_.clear();
+  std::stable_sort(mine.begin(), mine.end(), [](const Placement& a, const Placement& b) { return a.bytes > b.bytes; });
+  std::vector<Placement> placed;
+  for (Placement p : mine) {
+    // The lowest offset clear of every placed activation alive in an overlapping interval.
+    std::vector<std::pair<VkDeviceSize, VkDeviceSize>> taken;
+    for (const Placement& q : placed)
+      if (q.first <= p.last && p.first <= q.last) taken.emplace_back(q.offset, q.offset + q.bytes);
+    std::sort(taken.begin(), taken.end());
+    VkDeviceSize offset = 0;
+    for (const auto& [start, end] : taken) {
+      if (offset + p.bytes <= start) break;
+      offset = std::max(offset, (end + alignment - 1) / alignment * alignment);
+    }
+    p.offset = offset;
+    block = std::max(block, offset + p.bytes);
+    placed.push_back(p);
+  }
+  if (placed.empty()) return {before, 0};
+  activationBlock_ = context_.allocateDeviceMemory(block, types);
+  for (const Placement& p : placed)
+    rebind(*p.activation, context_.createBufferAt(activationBlock_, p.offset, p.bytes, p.activation->label.c_str()));
+  vk::Buffer whole = context_.createBufferAt(activationBlock_, 0, block, "activation block");
+  context_.fillZero(whole);
+  context_.destroyBuffer(whole);
+  return {before, block};
 }
 
 Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format) {
@@ -212,7 +292,9 @@ void Graph::capture(VkCommandBuffer commands, const std::string& name, const Act
   Activation* copy = allocate("boundary " + name, source.rows, source.channels, source.format);
   VkBufferCopy region{0, 0, source.validBytes()};
   context_.transferBarrier(commands);
-  vkCmdCopyBuffer(commands, source.buffer.buffer, copy->buffer.buffer, 1, &region);
+  // Through the context, so the lifetimes see the copy: the source is still read here, after its last kernel, and
+  // the capture is written here.
+  context_.cmdCopyBuffer(commands, source.buffer, copy->buffer, region);
   context_.transferBarrier(commands);
   boundaries_[name] = copy;
 }
